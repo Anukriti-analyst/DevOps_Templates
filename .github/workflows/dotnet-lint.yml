@@ -44,5 +44,5 @@ jobs:
         with:
           name: api-lint-report
           path: dotnet-format-report.txt
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 7
