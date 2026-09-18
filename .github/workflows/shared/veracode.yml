@@ -1,0 +1,66 @@
+name: Shared Veracode Pipeline Scan
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        required: false
+        type: string
+        default: ui-build-artifacts
+      zip-file-name:
+        required: false
+        type: string
+        default: veracode-source.zip
+
+permissions:
+  contents: read
+
+jobs:
+  veracode:
+    name: Veracode
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !(github.event_name == 'pull_request' && github.base_ref == 'main') }}
+    env:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID || '' }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY || '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: release
+
+      - name: Package application for Veracode
+        if: env.VERACODE_API_ID != '' && env.VERACODE_API_KEY != ''
+        run: zip -r ${{ inputs.zip-file-name }} release
+
+      - name: Run Veracode scan
+        if: env.VERACODE_API_ID != '' && env.VERACODE_API_KEY != ''
+        uses: veracode/Veracode-pipeline-scan-action@v1.0.20
+        with:
+          vid: ${{ env.VERACODE_API_ID }}
+          vkey: ${{ env.VERACODE_API_KEY }}
+          file: ${{ inputs.zip-file-name }}
+          fail_build: true
+
+      - name: Veracode credentials missing
+        if: env.VERACODE_API_ID == '' || env.VERACODE_API_KEY == ''
+        run: echo "::warning::Veracode scan skipped because credentials are missing."
+
+      - name: Block main branch when Veracode is not configured
+        if: github.event_name == 'pull_request' && github.base_ref == 'main' && (env.VERACODE_API_ID == '' || env.VERACODE_API_KEY == '')
+        run: exit 1
+
+      - name: Upload Veracode results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-report
+          path: |
+            veracode-source.zip
+            results*.json
+          if-no-files-found: ignore
+          retention-days: 7

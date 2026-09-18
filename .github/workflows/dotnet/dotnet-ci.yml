@@ -1,0 +1,58 @@
+name: .NET ASP.NET Core Build
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        required: false
+        type: string
+        default: '10.x'
+      solution-path:
+        required: false
+        type: string
+        default: FMEssentials.API/FMEssentials.API.sln
+      project-path:
+        required: false
+        type: string
+        default: FMEssentials.API/FMEssentials.API.csproj
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: ${{ inputs.dotnet-version }}
+  SOLUTION_PATH: ${{ inputs.solution-path }}
+  API_PROJECT_PATH: ${{ inputs.project-path }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_PATH }}
+
+      - name: Build solution
+        run: dotnet build ${{ env.SOLUTION_PATH }} --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test ${{ env.SOLUTION_PATH }} --configuration Release --no-build --no-restore
+
+      - name: Publish API package
+        run: dotnet publish ${{ env.API_PROJECT_PATH }} --configuration Release --no-restore --output publish
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fmessentials-api-${{ github.sha }}
+          path: publish
+          if-no-files-found: error
+          retention-days: 7
