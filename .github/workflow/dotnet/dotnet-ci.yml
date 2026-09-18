@@ -1,0 +1,20 @@
+name: .NET ASP.NET Core Build
+on: { workflow_call: }
+permissions: { contents: read }
+env:
+  DOTNET_VERSION: '10.x'
+  SOLUTION_PATH: FMEssentials.API/FMEssentials.API.sln
+  API_PROJECT_PATH: FMEssentials.API/FMEssentials.API.csproj
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: ${{ env.DOTNET_VERSION }} }
+      - run: dotnet restore ${{ env.SOLUTION_PATH }}
+      - run: dotnet build ${{ env.SOLUTION_PATH }} --configuration Release --no-restore
+      - run: dotnet test ${{ env.SOLUTION_PATH }} --configuration Release --no-build --no-restore
+      - run: dotnet publish ${{ env.API_PROJECT_PATH }} --configuration Release --no-restore --output publish
+      - uses: actions/upload-artifact@v4
+        with: { name: fmessentials-api-${{ github.sha }}, path: publish, if-no-files-found: error }
