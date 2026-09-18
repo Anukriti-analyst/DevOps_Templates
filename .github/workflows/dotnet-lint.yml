@@ -1,0 +1,48 @@
+name: .NET API Code Quality
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        required: false
+        type: string
+        default: '10.x'
+      solution-path:
+        required: false
+        type: string
+        default: PolicyIntake.API/PolicyIntake.API.sln
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: ${{ inputs.dotnet-version }}
+  SOLUTION_PATH: ${{ inputs.solution-path }}
+
+jobs:
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore "${{ env.SOLUTION_PATH }}"
+
+      - name: Run dotnet format validation
+        run: dotnet format "${{ env.SOLUTION_PATH }}" --verify-no-changes --severity info 2>&1 | tee dotnet-format-report.txt
+
+      - name: Upload code quality report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-lint-report
+          path: dotnet-format-report.txt
+          if-no-files-found: error
+          retention-days: 7
