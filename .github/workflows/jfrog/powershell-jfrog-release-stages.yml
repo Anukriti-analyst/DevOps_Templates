@@ -1,0 +1,873 @@
+# ========================================================================================================
+# PowerShell Module Pipeline Template for JFrog Direct Release Publishing
+# ========================================================================================================
+# Purpose:
+#   CI/CD workflow for PowerShell modules with direct publishing to a JFrog repository.
+#   Provides automated build manifest validation, lint, test, scan, and release workflows.
+#
+# Features:
+#   - Validates module manifest (Test-ModuleManifest)
+#   - Static analysis with PSScriptAnalyzer (optional)
+#   - Pester test execution with test results published (optional)
+#   - Integrated SonarQube (code quality) and Veracode (security) scanning (optional)
+#   - Packs PowerShell module as a NuGet package (.nupkg) via NuGetCommand@2 pack
+#   - Auto-generates .nuspec from .psd1 manifest when no .nuspec is supplied
+#   - Version validation: prevents publishing if version already exists in the release repo
+#   - Publishes to JFrog using JFrogDotnetCore@1 push (matches existing pattern)
+#
+# Workflow:
+#   PR / Manual builds:        Build & Test -> Scan (optional) -> Validate Version  (no publish)
+#   Main / Release branches:   Build & Test -> Scan (optional) -> Validate Version -> Publish to Release
+#
+# Notes:
+#   - PowerShell modules are stored in JFrog as NuGet packages (fm-powershell-local).
+#   - Only one repository is used (no evaluate / RC split). PR builds intentionally skip publish.
+#   - Version is always supplied via the required `version` parameter (caller computes it).
+#
+# Required Parameters:
+#   - version:             Full semver version for the module (caller-computed)
+#   - packagePath:         Folder containing the module files (psd1, psm1, scripts) - used as -BasePath when packing
+#   - manifestPath:        Relative path to the module manifest (.psd1) including filename
+#   - releaseEnvironment:  Azure DevOps environment name for release approval gate
+#
+# Optional Parameters:
+#   - pool:                       Agent pool (default: fm-ubuntu)
+#   - nuspecPath:                 Path to a checked-in .nuspec. If empty or missing, one is auto-generated from the .psd1.
+#   - powerShellVersion:          Reserved for future use (default: '')
+#   - pesterTestPath:             Path to Pester tests (file or folder). Empty disables Pester. (default: 'tests')
+#   - skipTests:                  Skip Pester tests (default: false)
+#   - enablePSScriptAnalyzer:     Run PSScriptAnalyzer lint (default: true)
+#   - enableSonarqube:            Run SonarQube scan (default: false)
+#   - sonarProjectKey:            Required when enableSonarqube=true
+#   - enableVeracode:             Run Veracode scan (default: false)
+#   - veracodeAppProfile:         Required when enableVeracode=true
+#   - veracodeWorkspaceSlug:      Veracode workspace slug for agent-based scan
+#   - veracodeExclude:            Paths to exclude from Veracode scan
+#   - veracodeUploadAndScanOptArgs: Additional upload-and-scan args
+#   - sonarServiceConnection:     SonarQube service connection (default: 'Sonarqube')
+#   - veracodeAnalysisService:    Veracode upload scan connection (default: 'Veracode Security Scans')
+#   - veracodeAgentBasedService:  Veracode agent-based scan connection (default: 'Veracode Agent Based')
+#   - stageNamePrefix:            Prefix for stage names when invoking multiple times (default: '')
+#
+# JFrog Configuration (Variables / Parameters):
+#   - jfrogServiceConnection:  'JFrog Artifactory V2'         (used by JFrogDotnetCore@1)
+#   - jfrogPlatformConnection: 'jfrog-v2-platform'            (used by JfrogCliV2@1)
+#   - jfrogReleaseRepo:        'fm-powershell-local'          (single repo - no evaluate split)
+#   - jfrogProjectKey:         'devops'
+#
+# Usage Example:
+#   resources:
+#     repositories:
+#       - repository: DevOps_Templates
+#         type: git
+#         name: DevOps_Templates
+#
+#   stages:
+#     - template: template_library/orchestrators/jfrog/powershell-jfrog-release-stages.yml@DevOps_Templates
+#       parameters:
+#         version: '1.2.3'
+#         packagePath: 'src/MyModule'
+#         manifestPath: 'src/MyModule/MyModule.psd1'
+#         releaseEnvironment: 'Production'
+#         pesterTestPath: 'tests'
+#         enableSonarqube: true
+#         sonarProjectKey: 'my-ps-module'
+#         enableVeracode: true
+#         veracodeAppProfile: 'MyPSModule'
+# ========================================================================================================
+
+parameters:
+  # ========================================
+  # REQUIRED PARAMETERS
+  # ========================================
+  - name: version
+    type: string
+    displayName: 'Module version (semver, caller-computed)'
+
+  - name: packagePath
+    type: string
+    displayName: 'Path to the PowerShell module directory (BasePath used during pack)'
+
+  - name: manifestPath
+    type: string
+    displayName: 'Relative path to the module manifest (.psd1) including filename'
+
+  - name: releaseEnvironment
+    type: string
+    displayName: 'Azure DevOps environment for release approval gate'
+
+  # ========================================
+  # OPTIONAL PARAMETERS
+  # ========================================
+
+  # Pool
+  - name: pool
+    type: object
+    default: fm-ubuntu
+    displayName: 'Agent pool for pipeline execution'
+
+  # Pack configuration
+  - name: nuspecPath
+    type: string
+    default: ''
+    displayName: 'Path to checked-in .nuspec file. If empty or missing, auto-generated from .psd1.'
+
+  # - name: powerShellVersion
+  #   type: string
+  #   default: ''
+  #   displayName: 'Reserved for future use (PowerShell version selection)'
+
+  # Tests / Lint
+  - name: pesterTestPath
+    type: string
+    default: 'tests'
+    displayName: 'Path to Pester tests (file or folder). Empty disables Pester.'
+
+  - name: skipTests
+    type: boolean
+    default: false
+    displayName: 'Skip running Pester tests'
+
+  - name: enablePSScriptAnalyzer
+    type: boolean
+    default: true
+    displayName: 'Run PSScriptAnalyzer lint over the module'
+
+  # Stage naming
+  - name: stageNamePrefix
+    type: string
+    default: ''
+    displayName: 'Prefix for stage names to ensure uniqueness when invoked multiple times'
+
+  # Scanning
+  - name: enableSonarqube
+    type: boolean
+    default: false
+    displayName: 'Enable SonarQube code quality scan'
+
+  - name: sonarProjectKey
+    type: string
+    default: ''
+    displayName: 'SonarQube project key (required if enableSonarqube=true)'
+
+  - name: enableVeracode
+    type: boolean
+    default: false
+    displayName: 'Enable Veracode security scan'
+
+  - name: veracodeAppProfile
+    type: string
+    default: ''
+    displayName: 'Veracode application profile name (required if enableVeracode=true)'
+
+  - name: veracodeWorkspaceSlug
+    type: string
+    default: ''
+    displayName: 'Veracode workspace slug for agent-based scan'
+
+  - name: veracodeExclude
+    type: string
+    default: ''
+    displayName: 'Comma or semicolon-separated paths to exclude from Veracode scan'
+
+  - name: veracodeUploadAndScanOptArgs
+    type: string
+    default: ''
+    displayName: 'Additional optional arguments for Veracode upload and scan'
+
+  - name: sonarServiceConnection
+    type: string
+    default: 'Sonarqube'
+    displayName: 'SonarQube service connection name'
+
+  - name: veracodeAnalysisService
+    type: string
+    default: 'Veracode Security Scans'
+    displayName: 'Veracode service connection for upload scan'
+
+  - name: veracodeAgentBasedService
+    type: string
+    default: 'Veracode Agent Based'
+    displayName: 'Veracode service connection for agent-based scan'
+
+  # ========================================
+  # JFROG CONFIGURATION
+  # ========================================
+  - name: jfrogServiceConnection
+    type: string
+    default: 'JFrog Artifactory V2'
+    displayName: 'JFrog Artifactory service connection (used by JFrogDotnetCore@1)'
+
+  - name: jfrogPlatformConnection
+    type: string
+    default: 'jfrog-v2-platform'
+    displayName: 'JFrog Platform service connection for CLI V2 tasks'
+
+  - name: jfrogReleaseRepo
+    type: string
+    default: 'fm-powershell-local'
+    displayName: 'JFrog PowerShell repository for releases'
+
+  - name: jfrogProjectKey
+    type: string
+    default: 'devops'
+    displayName: 'JFrog project key'
+
+stages:
+  # ========================================================================================================
+  # STAGE 1: Build & Test
+  # Purpose: Validate manifest, lint, test, and pack the PowerShell module as a .nupkg
+  # Runs on: All branches (PR and main/master/release)
+  # ========================================================================================================
+  - stage: ${{ parameters.stageNamePrefix }}build
+    displayName: '${{ parameters.stageNamePrefix }}Build & Test'
+    dependsOn: []
+    jobs:
+      - job: build_and_test
+        displayName: 'Build & Test'
+        ${{ if ne(length(parameters.pool), 0) }}:
+          pool: ${{ parameters.pool }}
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            persistCredentials: true
+
+          # ----------------------------------------------------------------
+          # Validate pipeline parameters
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              Write-Host "##[section]Validating pipeline parameters"
+
+              function Require([bool]$condition, [string]$message) {
+                if (-not $condition) {
+                  Write-Host "##vso[task.logissue type=error]$message"
+                  throw $message
+                }
+              }
+
+              Require (-not [string]::IsNullOrWhiteSpace('${{ parameters.version }}')) "version is required"
+              Require (-not [string]::IsNullOrWhiteSpace('${{ parameters.packagePath }}')) "packagePath is required"
+              Require (-not [string]::IsNullOrWhiteSpace('${{ parameters.manifestPath }}')) "manifestPath is required"
+
+              if (-not (Test-Path '${{ parameters.packagePath }}')) {
+                throw "packagePath does not exist: ${{ parameters.packagePath }}"
+              }
+              if (-not (Test-Path '${{ parameters.manifestPath }}')) {
+                throw "manifestPath does not exist: ${{ parameters.manifestPath }}"
+              }
+
+              # Validate version is semver
+              $semverPattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'
+              if ('${{ parameters.version }}' -notmatch $semverPattern) {
+                throw "version '${{ parameters.version }}' is not a valid semver string"
+              }
+
+              if ('${{ parameters.enableSonarqube }}' -eq 'true') {
+                Require (-not [string]::IsNullOrWhiteSpace('${{ parameters.sonarProjectKey }}')) "SonarQube is enabled but sonarProjectKey is empty"
+              }
+              if ('${{ parameters.enableVeracode }}' -eq 'true') {
+                Require (-not [string]::IsNullOrWhiteSpace('${{ parameters.veracodeAppProfile }}')) "Veracode is enabled but veracodeAppProfile is empty"
+              }
+
+              Write-Host "##[section]Validation passed"
+            displayName: 'Validate parameters'
+
+          # ----------------------------------------------------------------
+          # Install required PowerShell modules (Pester, PSScriptAnalyzer)
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              Write-Host "##[section]Installing PowerShell modules: Pester, PSScriptAnalyzer"
+              Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+
+              if ('${{ parameters.enablePSScriptAnalyzer }}' -eq 'true') {
+                if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+                  Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+                }
+              }
+
+              $needPester = ('${{ parameters.skipTests }}' -ne 'true') -and (-not [string]::IsNullOrWhiteSpace('${{ parameters.pesterTestPath }}'))
+              if ($needPester) {
+                if (-not (Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge [Version]'5.0.0' })) {
+                  Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser -SkipPublisherCheck
+                }
+              }
+
+              Get-Module -ListAvailable -Name Pester, PSScriptAnalyzer |
+                Select-Object Name, Version | Format-Table | Out-String | Write-Host
+            displayName: 'Install Pester / PSScriptAnalyzer'
+
+          # ----------------------------------------------------------------
+          # Validate the .psd1 manifest
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              Write-Host "##[section]Validating module manifest: ${{ parameters.manifestPath }}"
+              $manifest = Test-ModuleManifest -Path '${{ parameters.manifestPath }}'
+              Write-Host "Module name:    $($manifest.Name)"
+              Write-Host "Module version: $($manifest.Version)"
+              Write-Host "Author:         $($manifest.Author)"
+              Write-Host "Description:    $($manifest.Description)"
+            displayName: 'Test-ModuleManifest'
+
+          # ----------------------------------------------------------------
+          # PSScriptAnalyzer (lint)
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Continue'
+              Write-Host "##[section]Running PSScriptAnalyzer on ${{ parameters.packagePath }}"
+              $results = Invoke-ScriptAnalyzer -Path '${{ parameters.packagePath }}' -Recurse -Severity @('Error','Warning') -ErrorAction Continue
+              if ($results) {
+                $results | Format-Table -AutoSize | Out-String | Write-Host
+                $errors = @($results | Where-Object { $_.Severity -eq 'Error' })
+                if ($errors.Count -gt 0) {
+                  Write-Host "##vso[task.logissue type=error]PSScriptAnalyzer found $($errors.Count) error-level issue(s)"
+                  Write-Host "##vso[task.complete result=SucceededWithIssues;]PSScriptAnalyzer errors detected"
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]PSScriptAnalyzer found $($results.Count) warning-level issue(s)"
+                }
+              } else {
+                Write-Host "PSScriptAnalyzer: no issues found"
+              }
+            displayName: 'PSScriptAnalyzer lint'
+            condition: and(succeeded(), eq('${{ parameters.enablePSScriptAnalyzer }}', 'true'))
+            continueOnError: true
+
+          # ----------------------------------------------------------------
+          # Pester tests
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Continue'
+              $testPath = '${{ parameters.pesterTestPath }}'
+              if ([string]::IsNullOrWhiteSpace($testPath) -or -not (Test-Path $testPath)) {
+                Write-Host "##[warning]Pester test path '$testPath' not found - skipping tests"
+                exit 0
+              }
+
+              Import-Module Pester -MinimumVersion 5.0.0 -Force
+              $config = New-PesterConfiguration
+              $config.Run.Path = $testPath
+              $config.TestResult.Enabled = $true
+              $config.TestResult.OutputFormat = 'NUnitXml'
+              $config.TestResult.OutputPath = "$(Common.TestResultsDirectory)/pester-results.xml"
+              $config.Output.Verbosity = 'Detailed'
+              Invoke-Pester -Configuration $config
+            displayName: 'Run Pester tests'
+            condition: and(succeeded(), eq('${{ parameters.skipTests }}', 'false'))
+            continueOnError: true
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Pester test results'
+            condition: and(always(), eq('${{ parameters.skipTests }}', 'false'))
+            inputs:
+              testResultsFormat: 'NUnit'
+              testResultsFiles: '$(Common.TestResultsDirectory)/pester-results.xml'
+              failTaskOnFailedTests: false
+              testRunTitle: 'Pester - ${{ parameters.stageNamePrefix }}PowerShell module'
+
+          # ----------------------------------------------------------------
+          # Sync the .psd1 ModuleVersion to the version parameter.
+          # NOTE: This mutates the .psd1 only inside the agent workspace - it is
+          # never pushed back to source control. The packed .nupkg will carry
+          # the caller-supplied version everywhere downstream.
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $manifestPath = '${{ parameters.manifestPath }}'
+              $newVersion = '${{ parameters.version }}'
+              Write-Host "##[section]Syncing manifest ModuleVersion -> $newVersion"
+
+              # Strip any pre-release suffix for ModuleVersion (semver pre-release goes in PrivateData)
+              $coreVersion = $newVersion
+              $prerelease = $null
+              if ($newVersion -match '^([0-9]+\.[0-9]+\.[0-9]+)(?:-(.+))?$') {
+                $coreVersion = $matches[1]
+                if ($matches[2]) { $prerelease = $matches[2] -replace '[^0-9a-zA-Z]', '' }
+              }
+
+              $params = @{ Path = $manifestPath; ModuleVersion = $coreVersion }
+              if ($prerelease) { $params['Prerelease'] = $prerelease }
+              Update-ModuleManifest @params
+              Write-Host "Manifest updated: ModuleVersion=$coreVersion Prerelease=$prerelease"
+            displayName: 'Sync manifest version'
+
+          # ----------------------------------------------------------------
+          # Resolve / auto-generate .nuspec
+          # ----------------------------------------------------------------
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $nuspecPath = '${{ parameters.nuspecPath }}'
+              $manifestPath = '${{ parameters.manifestPath }}'
+              $version = '${{ parameters.version }}'
+
+              if (-not [string]::IsNullOrWhiteSpace($nuspecPath) -and (Test-Path $nuspecPath)) {
+                Write-Host "##[section]Using checked-in .nuspec: $nuspecPath"
+                $resolved = (Resolve-Path $nuspecPath).Path
+                Write-Host "##vso[task.setvariable variable=resolvedNuspecPath]$resolved"
+
+                # Inspect <file src> entries: if any already start with packagePath, use repo root as BasePath
+                [xml]$nuspecXml = Get-Content $resolved
+                $pkgPath = ('${{ parameters.packagePath }}' -replace '\\', '/').TrimEnd('/')
+                $needsRootBase = $false
+                foreach ($fileEntry in $nuspecXml.package.files.file) {
+                  if (-not $fileEntry) { continue }
+                  $srcNorm = ($fileEntry.src -replace '\\', '/').TrimStart('./')
+                  if ($srcNorm -like "$pkgPath/*" -or $srcNorm -eq $pkgPath) {
+                    $needsRootBase = $true; break
+                  }
+                }
+                $resolvedBase = if ($needsRootBase) { '.' } else { '${{ parameters.packagePath }}' }
+                Write-Host "Auto-detected BasePath: $resolvedBase (nuspec src paths contain packagePath prefix: $needsRootBase)"
+                Write-Host "##vso[task.setvariable variable=resolvedBasePath]$resolvedBase"
+                exit 0
+              }
+
+              Write-Host "##[section]No .nuspec provided - auto-generating from manifest"
+              $manifest = Test-ModuleManifest -Path $manifestPath -ErrorAction Stop
+              $moduleName  = $manifest.Name
+              $author      = if ($manifest.Author)      { $manifest.Author }      else { 'FM' }
+              $companyName = if ($manifest.CompanyName) { $manifest.CompanyName } else { $author }
+              $description = if ($manifest.Description) { $manifest.Description } else { $moduleName }
+              $projectUri  = if ($manifest.ProjectUri)  { $manifest.ProjectUri.AbsoluteUri } else { '' }
+              $licenseUri  = if ($manifest.LicenseUri)  { $manifest.LicenseUri.AbsoluteUri } else { '' }
+              $tags        = if ($manifest.Tags)        { ($manifest.Tags -join ' ') } else { 'PowerShell Module' }
+              $copyright   = if ($manifest.Copyright)   { $manifest.Copyright } else { "(c) $((Get-Date).Year) $companyName" }
+
+              $generatedPath = Join-Path '$(Build.ArtifactStagingDirectory)' 'generated.nuspec'
+              New-Item -ItemType Directory -Path (Split-Path $generatedPath) -Force | Out-Null
+
+              $xml = New-Object System.Xml.XmlDocument
+              $decl = $xml.CreateXmlDeclaration('1.0', 'utf-8', $null); [void]$xml.AppendChild($decl)
+              $pkg  = $xml.CreateElement('package'); [void]$xml.AppendChild($pkg)
+              $meta = $xml.CreateElement('metadata'); [void]$pkg.AppendChild($meta)
+
+              function Add-Elem($parent, $name, $value) {
+                if ($null -eq $value -or $value -eq '') { return }
+                $e = $parent.OwnerDocument.CreateElement($name)
+                $e.InnerText = [string]$value
+                [void]$parent.AppendChild($e)
+              }
+
+              Add-Elem $meta 'id'          $moduleName
+              Add-Elem $meta 'version'     $version
+              Add-Elem $meta 'authors'     $author
+              Add-Elem $meta 'owners'      $companyName
+              Add-Elem $meta 'description' $description
+              Add-Elem $meta 'projectUrl'  $projectUri
+              Add-Elem $meta 'licenseUrl'  $licenseUri
+              Add-Elem $meta 'tags'        $tags
+              Add-Elem $meta 'copyright'   $copyright
+              Add-Elem $meta 'requireLicenseAcceptance' 'false'
+
+              # Include every file under packagePath
+              $files = $xml.CreateElement('files'); [void]$pkg.AppendChild($files)
+              $fileNode = $xml.CreateElement('file')
+              $fileNode.SetAttribute('src', '**/*')
+              $fileNode.SetAttribute('target', '.')
+              [void]$files.AppendChild($fileNode)
+
+              $xml.Save($generatedPath)
+              Write-Host "Generated .nuspec written to: $generatedPath"
+              Get-Content $generatedPath | Write-Host
+
+              Write-Host "##vso[task.setvariable variable=resolvedNuspecPath]$generatedPath"
+              # Generated nuspec uses src='**/*' relative to packagePath
+              Write-Host "##vso[task.setvariable variable=resolvedBasePath]${{ parameters.packagePath }}"
+            displayName: 'Resolve / auto-generate .nuspec'
+
+          # ----------------------------------------------------------------
+          # Pack the module as a .nupkg using NuGetCommand@2 (matches existing pattern).
+          # -BasePath points at the module folder so all module files end up at the .nupkg root.
+          # ----------------------------------------------------------------
+          - task: NuGetCommand@2
+            displayName: 'Pack PowerShell module as .nupkg'
+            inputs:
+              command: custom
+              arguments: 'pack "$(resolvedNuspecPath)" -OutputDirectory "$(Build.ArtifactStagingDirectory)/packages" -Version ${{ parameters.version }} -BasePath "$(resolvedBasePath)" -NoDefaultExcludes'
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $dir = "$(Build.ArtifactStagingDirectory)/packages"
+              $pkgs = Get-ChildItem -Path $dir -Filter '*.nupkg' -File
+              if ($pkgs.Count -ne 1) {
+                throw "Expected exactly one .nupkg in $dir, found $($pkgs.Count)"
+              }
+              Write-Host "Packed: $($pkgs[0].FullName) ($([math]::Round($pkgs[0].Length/1KB,2)) KB)"
+            displayName: 'Verify packed .nupkg'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish .nupkg artifact'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/packages'
+              artifactName: '${{ parameters.stageNamePrefix }}powershell-package'
+
+          # Source artifact for scanners (SonarQube / Veracode need source code, not the .nupkg)
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish source code for scanning'
+            condition: or(eq('${{ parameters.enableSonarqube }}', 'true'), eq('${{ parameters.enableVeracode }}', 'true'))
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)'
+              artifactName: '${{ parameters.stageNamePrefix }}build-output'
+
+  # ========================================================================================================
+  # STAGE 2: Code Scanning (optional)
+  # ========================================================================================================
+  - ${{ if or(eq(parameters.enableSonarqube, true), eq(parameters.enableVeracode, true)) }}:
+    - stage: ${{ parameters.stageNamePrefix }}scan
+      displayName: '${{ parameters.stageNamePrefix }}Code Scanning'
+      dependsOn: ${{ parameters.stageNamePrefix }}build
+      jobs:
+        - ${{ if eq(parameters.enableSonarqube, true) }}:
+          - template: ../../shared/scanning/sonarqube-scan-job.yml
+            parameters:
+              pool: ${{ parameters.pool }}
+              sonarServiceConnection: ${{ parameters.sonarServiceConnection }}
+              sonarProjectKey: ${{ parameters.sonarProjectKey }}
+              packagePath: ${{ parameters.packagePath }}
+              downloadBuildArtifacts: true
+              artifactName: '${{ parameters.stageNamePrefix }}build-output'
+
+        - ${{ if eq(parameters.enableVeracode, true) }}:
+          - template: ../../shared/scanning/veracode-scan-job.yml
+            parameters:
+              pool: ${{ parameters.pool }}
+              veracodeAnalysisService: ${{ parameters.veracodeAnalysisService }}
+              veracodeAgentBasedService: ${{ parameters.veracodeAgentBasedService }}
+              veracodeAppProfile: ${{ parameters.veracodeAppProfile }}
+              veracodeWorkspaceSlug: ${{ parameters.veracodeWorkspaceSlug }}
+              packagePath: ${{ parameters.packagePath }}
+              artifactName: '${{ parameters.stageNamePrefix }}build-output'
+              exclude: ${{ parameters.veracodeExclude }}
+              UploadAndScanOptArgs: ${{ parameters.veracodeUploadAndScanOptArgs }}
+
+  # ========================================================================================================
+  # STAGE 3: Validate Version
+  # Purpose: Verify the version does not already exist in the JFrog release repo.
+  # ========================================================================================================
+  - stage: ${{ parameters.stageNamePrefix }}validate_version
+    displayName: '${{ parameters.stageNamePrefix }}Validate Version'
+    ${{ if or(eq(parameters.enableSonarqube, true), eq(parameters.enableVeracode, true)) }}:
+      dependsOn: ${{ parameters.stageNamePrefix }}scan
+    ${{ else }}:
+      dependsOn: ${{ parameters.stageNamePrefix }}build
+    jobs:
+      - job: check_version
+        displayName: 'Check version in release repo'
+        ${{ if ne(length(parameters.pool), 0) }}:
+          pool: ${{ parameters.pool }}
+        steps:
+          - checkout: none
+
+          # Tag build based on branch type
+          - pwsh: |
+              $sourceBranch = '$(Build.SourceBranchName)'
+              $isMainBranch = $sourceBranch -match '^(main|master|release|Release)' -or `
+                              ('$(Build.SourceBranch)' -like 'refs/heads/Release*')
+              if ($isMainBranch) {
+                Write-Host "##vso[build.addbuildtag]CI-build"
+              } else {
+                Write-Host "##vso[build.addbuildtag]nonCI-build"
+              }
+            displayName: 'Tag build type'
+
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download .nupkg artifact'
+            inputs:
+              artifactName: '${{ parameters.stageNamePrefix }}powershell-package'
+              targetPath: '$(Pipeline.Workspace)/packages'
+
+          # Read package id + version from the .nuspec embedded in the .nupkg
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              Write-Host "##[section]Extracting metadata from .nupkg"
+
+              $artifactDir = '$(Pipeline.Workspace)/packages'
+              $nupkgFiles = Get-ChildItem -Path $artifactDir -Filter '*.nupkg' -File
+              if ($nupkgFiles.Count -ne 1) {
+                throw "Expected exactly one .nupkg in $artifactDir, found $($nupkgFiles.Count)"
+              }
+              $nupkgPath = $nupkgFiles[0].FullName
+              Write-Host "Found .nupkg: $($nupkgFiles[0].Name)"
+
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkgPath)
+              try {
+                $nuspecEntry = $zip.Entries | Where-Object { $_.Name -like '*.nuspec' } | Select-Object -First 1
+                if (-not $nuspecEntry) { throw "No .nuspec found inside .nupkg" }
+                $nuspecEntryName = $nuspecEntry.FullName
+                $stream = $nuspecEntry.Open()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $nuspecContent = $reader.ReadToEnd()
+                $reader.Close(); $stream.Close()
+              } finally {
+                $zip.Dispose()
+              }
+
+              Write-Host "##[group]Embedded .nuspec content ($nuspecEntryName)"
+              Write-Host $nuspecContent
+              Write-Host "##[endgroup]"
+
+              [xml]$nuspec = $nuspecContent
+              # local-name() matches <id>/<version> regardless of which nuspec XSD namespace NuGet injects
+              $idNode  = $nuspec.SelectSingleNode("//*[local-name()='id']")
+              $verNode = $nuspec.SelectSingleNode("//*[local-name()='version']")
+
+              if (-not $idNode -or -not $verNode) {
+                Write-Host "##[warning]Nuspec entry inside .nupkg: $nuspecEntryName"
+                Write-Host "##[warning]Root element:              $($nuspec.DocumentElement.LocalName)"
+                Write-Host "##[warning]Root namespace URI:        $($nuspec.DocumentElement.NamespaceURI)"
+                throw "Could not find <id> or <version> in .nuspec"
+              }
+
+              $packageId = $idNode.InnerText.Trim()
+              $packageVersion = $verNode.InnerText.Trim()
+
+              # Cross-check against the caller-supplied version
+              $expected = '${{ parameters.version }}'
+              if ($packageVersion -ne $expected) {
+                throw "Packed .nuspec version '$packageVersion' does not match version parameter '$expected'"
+              }
+
+              if ($packageId -match '[@/]') {
+                throw "Invalid package ID '$packageId' (contains '@' or '/')"
+              }
+
+              $semverPattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'
+              if ($packageVersion -notmatch $semverPattern) {
+                throw "Invalid semver: $packageVersion"
+              }
+
+              $sanitizedName = $packageId -replace '[^a-zA-Z0-9-_.]', '-'
+
+              $repo       = '${{ parameters.jfrogReleaseRepo }}'
+              $targetPath = "$repo/$sanitizedName/$packageId.$packageVersion.nupkg"
+
+              Write-Host "##[section]Package metadata summary"
+              Write-Host "----------------------------------------------------------------------"
+              Write-Host "  Package ID       : $packageId"
+              Write-Host "  Package Version  : $packageVersion"
+              Write-Host "  Sanitized name   : $sanitizedName"
+              Write-Host "  Target repo      : $repo"
+              Write-Host "  JFrog lookup path: $targetPath"
+              Write-Host "----------------------------------------------------------------------"
+
+              Write-Host "##vso[task.setvariable variable=packageId;isOutput=true]$packageId"
+              Write-Host "##vso[task.setvariable variable=packageVersion;isOutput=true]$packageVersion"
+              Write-Host "##vso[task.setvariable variable=sanitizedPackageName;isOutput=true]$sanitizedName"
+            displayName: 'Read and validate package metadata'
+            name: versionInfo
+
+          - task: JfrogCliV2@1
+            displayName: 'Search for existing version in release repo'
+            name: searchExisting
+            continueOnError: false
+            env:
+              JFROG_CLI_AVOID_NEW_VERSION_WARNING: 'TRUE'
+            inputs:
+              jfrogPlatformConnection: ${{ parameters.jfrogPlatformConnection }}
+              command: |
+                jf rt search "${{ parameters.jfrogReleaseRepo }}/$(versionInfo.sanitizedPackageName)/$(versionInfo.packageId).$(versionInfo.packageVersion).nupkg" > version-check-results.json
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $packageId = '$(versionInfo.packageId)'
+              $version   = '$(versionInfo.packageVersion)'
+              $repo      = '${{ parameters.jfrogReleaseRepo }}'
+              $lookup    = "$repo/$(versionInfo.sanitizedPackageName)/$packageId.$version.nupkg"
+
+              Write-Host "##[section]Version uniqueness check: $packageId@$version"
+
+              $matches = @()
+              $rawJson = ''
+              if (Test-Path 'version-check-results.json') {
+                $rawJson = (Get-Content 'version-check-results.json' -Raw).Trim()
+                if ($rawJson) {
+                  try {
+                    $parsed = $rawJson | ConvertFrom-Json -ErrorAction Stop
+                    if ($parsed) { $matches = @($parsed) }
+                  } catch {
+                    Write-Host "##[warning]Could not parse version-check-results.json - treating as empty"
+                  }
+                }
+              }
+              $exists = $matches.Count -gt 0
+
+              Write-Host "##[group]Raw JFrog search result (version-check-results.json)"
+              if ([string]::IsNullOrWhiteSpace($rawJson) -or $rawJson -eq '[]') {
+                Write-Host "  No matching artifacts found - this version is available for publishing."
+              } else {
+                try {
+                  $rawJson | ConvertFrom-Json | ConvertTo-Json -Depth 10 | Write-Host
+                } catch {
+                  Write-Host $rawJson
+                }
+              }
+              Write-Host "##[endgroup]"
+
+              Write-Host "----------------------------------------------------------------------"
+              Write-Host "  Package  : $packageId"
+              Write-Host "  Version  : $version"
+              Write-Host "  Repo     : $repo"
+              Write-Host "  Lookup   : $lookup"
+              Write-Host "  Matches  : $($matches.Count)"
+              Write-Host "  Status   : $(if ($exists) { 'ALREADY PUBLISHED (fail)' } else { 'AVAILABLE (ok)' })"
+              Write-Host "----------------------------------------------------------------------"
+
+              if ($exists) {
+                Write-Host "##[group]Existing artifacts blocking this version"
+                $matches | ForEach-Object { Write-Host "  - $($_.path)" }
+                Write-Host "##[endgroup]"
+                Write-Host "##vso[task.logissue type=error]Version $version of $packageId already exists in $repo"
+                Write-Host "##vso[task.complete result=Failed;]Version already published - increment version and rebuild"
+                exit 1
+              }
+
+              Write-Host "##[section]OK - version $version is available for publishing"
+            displayName: 'Validate version is unique'
+
+  # ========================================================================================================
+  # STAGE 4: Publish to Release (main / master / Release branches only, non-PR)
+  # PR / Manual builds intentionally skip publish (matches existing pattern).
+  # ========================================================================================================
+  # - ${{ if and(ne(variables['Build.Reason'], 'PullRequest'), or(in(variables['Build.SourceBranchName'], 'main', 'master'), startsWith(variables['Build.SourceBranch'], 'refs/heads/Release'))) }}:
+  - ${{ if eq('1', '1') }}:
+    - stage: ${{ parameters.stageNamePrefix }}publish_release
+      displayName: '${{ parameters.stageNamePrefix }}Publish to Release'
+      dependsOn: ${{ parameters.stageNamePrefix }}validate_version
+      jobs:
+        - deployment: publish
+          environment: ${{ parameters.releaseEnvironment }}
+          displayName: 'Publish to JFrog release repo'
+          ${{ if ne(length(parameters.pool), 0) }}:
+            pool: ${{ parameters.pool }}
+          variables:
+            packageVersion: $[ stageDependencies.${{ parameters.stageNamePrefix }}validate_version.check_version.outputs['versionInfo.packageVersion'] ]
+            packageId:      $[ stageDependencies.${{ parameters.stageNamePrefix }}validate_version.check_version.outputs['versionInfo.packageId'] ]
+            sanitizedPackageName: $[ stageDependencies.${{ parameters.stageNamePrefix }}validate_version.check_version.outputs['versionInfo.sanitizedPackageName'] ]
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: none
+
+                  - task: DownloadPipelineArtifact@2
+                    displayName: 'Download .nupkg artifact'
+                    inputs:
+                      artifactName: '${{ parameters.stageNamePrefix }}powershell-package'
+                      targetPath: '$(Pipeline.Workspace)/packages'
+
+                  - pwsh: |
+                      $ErrorActionPreference = 'Stop'
+                      $src = Get-ChildItem '$(Pipeline.Workspace)/packages' -Filter '*.nupkg' -File
+                      if ($src.Count -ne 1) { throw "Expected exactly one .nupkg, found $($src.Count)" }
+
+                      $targetDir = '$(Build.ArtifactStagingDirectory)/packages'
+                      New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+                      $targetPath = Join-Path $targetDir ("$(packageId)." + "$(packageVersion)" + '.nupkg')
+                      Copy-Item -Path $src[0].FullName -Destination $targetPath -Force
+                      Write-Host "Staged for publish: $targetPath"
+                    displayName: 'Stage .nupkg for publishing'
+
+                  - task: JFrogDotnetCore@1
+                    displayName: 'Publish to JFrog (release)'
+                    inputs:
+                      command: 'push'
+                      targetDeployRepo: ${{ parameters.jfrogReleaseRepo }}
+                      artifactoryConnection: ${{ parameters.jfrogServiceConnection }}
+                      pathToNupkg: '$(Build.ArtifactStagingDirectory)/packages/*.nupkg'
+                      collectBuildInfo: true
+                      targetDeployPath: '$(sanitizedPackageName)'
+                      buildName: '$(Build.DefinitionName)-$(sanitizedPackageName)'
+                      buildNumber: '$(Build.BuildNumber)'
+                      projectKey: ${{ parameters.jfrogProjectKey }}
+
+                  # ----------------------------------------------------------------
+                  # Post-publish verification: confirm the exact artifact actually
+                  # landed in the release repo. Guards against silent failures where
+                  # the push task reports success but nothing usable was uploaded.
+                  # ----------------------------------------------------------------
+                  - task: JfrogCliV2@1
+                    displayName: 'Verify publish (search Artifactory)'
+                    name: verifyPublish
+                    condition: succeeded()
+                    inputs:
+                      jfrogPlatformConnection: ${{ parameters.jfrogPlatformConnection }}
+                      command: |
+                        jf rt search "${{ parameters.jfrogReleaseRepo }}/$(sanitizedPackageName)/$(packageId).$(packageVersion).nupkg" > publish-verify-results.json
+
+                  - pwsh: |
+                      $ErrorActionPreference = 'Stop'
+                      $expectedPath = "${{ parameters.jfrogReleaseRepo }}/$(sanitizedPackageName)/$(packageId).$(packageVersion).nupkg"
+                      Write-Host "##[section]Verifying artifact exists at: $expectedPath"
+
+                      $found = $false
+                      if (Test-Path 'publish-verify-results.json') {
+                        $raw = Get-Content 'publish-verify-results.json' -Raw
+                        try {
+                          $results = $raw | ConvertFrom-Json -ErrorAction Stop
+                          if ($results -and $results.Count -gt 0) {
+                            $found = $true
+                            Write-Host "Artifact found in Artifactory:"
+                            $results | ForEach-Object { Write-Host "  - $($_.path)" }
+                          }
+                        } catch {
+                          Write-Host "Search result was empty or not valid JSON"
+                        }
+                      }
+
+                      if (-not $found) {
+                        Write-Host "##vso[task.logissue type=error]Publish task reported success but artifact was NOT found in Artifactory: $expectedPath"
+                        Write-Host "##vso[task.complete result=Failed;]Post-publish verification failed - artifact missing from release repo"
+                        exit 1
+                      }
+
+                      Write-Host "##[section]Post-publish verification passed"
+                    displayName: 'Confirm artifact in release repo'
+                    condition: succeeded()
+
+                  # ----------------------------------------------------------------
+                  # Failure diagnostics: emit a standardized, actionable error
+                  # message whenever any preceding publish step in this job failed.
+                  # Runs only on failure; keeps the stage result as Failed.
+                  # ----------------------------------------------------------------
+                  - pwsh: |
+                      $ErrorActionPreference = 'Continue'
+                      $artifact = "$(packageId).$(packageVersion).nupkg"
+                      $targetPath = "${{ parameters.jfrogReleaseRepo }}/$(sanitizedPackageName)/$artifact"
+                      $sourcePath = "$(Build.ArtifactStagingDirectory)/packages/$artifact"
+
+                      Write-Host "##vso[task.logissue type=error]Publish to JFrog failed for $artifact -> ${{ parameters.jfrogReleaseRepo }}"
+                      Write-Host "##[error]==================== JFROG PUBLISH FAILURE ===================="
+                      Write-Host "##[error] Package ID              : $(packageId)"
+                      Write-Host "##[error] Package Version         : $(packageVersion)"
+                      Write-Host "##[error] Artifact file           : $artifact"
+                      Write-Host "##[error] Source path (agent)     : $sourcePath"
+                      Write-Host "##[error] Target repo             : ${{ parameters.jfrogReleaseRepo }}"
+                      Write-Host "##[error] Target deploy path      : $(sanitizedPackageName)"
+                      Write-Host "##[error] Full target path        : $targetPath"
+                      Write-Host "##[error] JFrog project key       : ${{ parameters.jfrogProjectKey }}"
+                      Write-Host "##[error] Artifactory connection  : ${{ parameters.jfrogServiceConnection }}"
+                      Write-Host "##[error] Platform connection     : ${{ parameters.jfrogPlatformConnection }}"
+                      Write-Host "##[error] ---------------- Troubleshooting checklist ----------------"
+                      Write-Host "##[error] 1. Service connection '${{ parameters.jfrogServiceConnection }}' exists in this ADO project and is authorized for this pipeline."
+                      Write-Host "##[error] 2. The identity behind the connection has 'Deploy/Cache' + 'Annotate' permission on repo '${{ parameters.jfrogReleaseRepo }}'."
+                      Write-Host "##[error] 3. Repository '${{ parameters.jfrogReleaseRepo }}' exists in JFrog and is a NuGet-compatible local repo."
+                      Write-Host "##[error] 4. JFrog project key '${{ parameters.jfrogProjectKey }}' matches the project that owns '${{ parameters.jfrogReleaseRepo }}'."
+                      Write-Host "##[error] 5. Target path '$targetPath' is not blocked by an existing artifact, path collision, or repo layout rule."
+                      Write-Host "##[error] 6. Source .nupkg exists on the agent at '$sourcePath' (check the 'Stage .nupkg for publishing' step logs)."
+                      Write-Host "##[error] 7. Agent pool '${{ parameters.pool }}' has network egress to the JFrog Artifactory endpoint (no proxy/firewall block)."
+                      Write-Host "##[error] 8. If the publish task reported success but this diagnostic fired from the verify step, the artifact may have been uploaded to a different path - inspect 'publish-verify-results.json' in the previous step's logs."
+                      Write-Host "##[error] Inspect the 'Publish to JFrog (release)' task log above for the raw JFrog CLI / task error."
+                      Write-Host "##[error] ==============================================================="
+                    displayName: 'Publish failure diagnostics'
+                    condition: failed()
+
+                  - pwsh: |
+                      Write-Host "##vso[build.updatebuildnumber]$(packageVersion)"
+                      Write-Host "##[section] PowerShell Package Published Successfully"
+                      Write-Host " Package ID: $(packageId)"
+                      Write-Host " Version: $(packageVersion)"
+                      Write-Host " Repository: ${{ parameters.jfrogReleaseRepo }}"
+                    displayName: 'Publish summary'
+                    condition: succeeded()
